@@ -1,3 +1,28 @@
+"""
+PyTorch script for model training (MobileNetV2).
+
+Copyright (C) 2021 by Akira TAMAMORI
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+"""
+
 # Standard library imports.
 import datetime
 import os
@@ -12,19 +37,126 @@ import torch
 import torch.utils.data
 from scipy.special import softmax
 from torch import optim
-from torch.utils.data.dataset import Subset
 from torchinfo import summary
 
 # Local application/library specific imports.
 import util
 from models import MobileNetV2
-import data_utils
 
 # Load configuration from YAML file.
 CONFIG = util.load_yaml("./config.yaml")
 
 # String constant: "cuda:0" or "cpu"
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def flatten(nested_list):
+    """
+    Flatten list.
+    """
+    return list(chain.from_iterable(nested_list))
+
+
+def concat_features(file_list):
+    """
+    Extract features from audio files and then concate them into an array.
+    """
+    # calculate the number of dimensions
+    n_features = []
+    for file_id, file_name in enumerate(file_list):
+
+        # extract feature from audio file.
+        feature = util.extract_feature(file_name, CONFIG["feature"])
+        feature = feature[:: CONFIG["feature"]["n_hop_frames"], :]
+
+        if file_id == 0:
+            features = numpy.zeros(
+                (
+                    len(file_list) * feature.shape[0],
+                    CONFIG["feature"]["n_mels"] * CONFIG["feature"]["n_frames"],
+                ),
+                dtype=float,
+            )
+
+        features[
+            feature.shape[0] * file_id : feature.shape[0] * (file_id + 1), :
+        ] = feature
+
+        n_features.append(feature.shape[0])
+
+    return features, n_features
+
+
+class DcaseDataset(torch.utils.data.Dataset):
+    """
+    Prepare dataset.
+    """
+
+    def __init__(self, unique_section_names, target_dir, mode):
+        super().__init__()
+
+        n_files_ea_section = []  # number of files for each section
+        n_vectors_ea_file = []  # number of vectors for each file
+        data = numpy.empty(
+            (0, CONFIG["feature"]["n_frames"] * CONFIG["feature"]["n_mels"]),
+            dtype=float,
+        )
+
+        for section_name in unique_section_names:
+            # get file list for each section
+            # all values of y_true are zero in training
+            print("target_dir : %s" % (target_dir + "_" + section_name))
+            files, _ = util.file_list_generator(
+                target_dir=target_dir,
+                section_name=section_name,
+                dir_name="train",
+                mode=mode,
+            )
+            print("number of files : %s" % (str(len(files))))
+
+            n_files_ea_section.append(len(files))
+
+            # extract features from audio files and
+            # concatenate them into Numpy array.
+            features, n_features = concat_features(files)
+
+            data = numpy.append(data, features, axis=0)
+            n_vectors_ea_file.append(n_features)
+
+        n_vectors_ea_file = flatten(n_vectors_ea_file)
+
+        # make target labels for conditioning
+        # they are not one-hot vector!
+        labels = numpy.zeros((data.shape[0]), dtype=int)
+        start_index = 0
+        for section_index in range(unique_section_names.shape[0]):
+            for file_id in range(n_files_ea_section[section_index]):
+                labels[
+                    start_index : start_index + n_vectors_ea_file[file_id]
+                ] = section_index
+                start_index += n_vectors_ea_file[file_id]
+
+        # 1D vector to 2D image (1ch)
+        self.data = data.reshape(
+            (
+                data.shape[0],
+                1,  # number of channels
+                CONFIG["feature"]["n_frames"],
+                CONFIG["feature"]["n_mels"],
+            )
+        )
+
+        self.labels = labels
+
+    def __len__(self):
+        return self.data.shape[0]  # return num of samples
+
+    def __getitem__(self, index):
+        sample = self.data[index, :]
+        label = self.labels[index]
+
+        return sample, label
+
 
 def get_dataloader(dataset):
     """
@@ -249,18 +381,23 @@ def save_model(model, model_dir, machine_type):
     print("save_model -> %s" % (model_file_path))
 
 
-
-
 def main():
-    
+    """
+    Perform model training and validation.
+    """
+
+    # check mode
+    # "development": mode == True
+    # "evaluation": mode == False
     mode = util.command_line_chk()  # constant: True or False
     if mode is None:
         sys.exit(-1)
 
+    # make output directory
     os.makedirs(CONFIG["model_directory"], exist_ok=True)
-    
+
+    # load base_directory list
     dir_list = util.select_dirs(config=CONFIG, mode=mode)
-    
     for idx, target_dir in enumerate(dir_list):
         print("===============================================")
         print("[%d/%d] %s" % (idx + 1, len(dir_list), target_dir))
@@ -274,7 +411,7 @@ def main():
         joblib.dump(unique_section_names, section_names_file_path)
 
         print("\n============== DATASET_GENERATOR ==============")
-        dcase_dataset = data_utils.DcaseDataset(unique_section_names, target_dir, mode)
+        dcase_dataset = DcaseDataset(unique_section_names, target_dir, mode)
         print("===============================================")
 
         print("\n=========== DATALOADER_GENERATOR ==============")
